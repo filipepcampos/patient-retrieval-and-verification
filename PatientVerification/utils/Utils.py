@@ -5,7 +5,8 @@ import math
 import random
 import itertools
 import numpy as np
-from dataset.SiameseDataset import SiameseDataset
+# from dataset.SiameseDataset import SiameseDataset
+from dataset.SiameseDatasetMimic import SiameseDataset
 import matplotlib.pyplot as plt
 
 
@@ -16,7 +17,7 @@ AgentSiameseNetwork.py which provides the actual training/validation loop and th
 
 
 # Function to get the data loader.
-def get_data_loaders(phase='training', data_handling='balanced', n_channels=3, n_samples=100000, transform=None,
+def get_data_loaders(phase='training', data_handling='randomized', n_channels=3, n_samples=100000, transform=None,
                      image_path='./', batch_size=32, shuffle=True, num_workers=16, pin_memory=True, save_path=None):
 
     dataset = SiameseDataset(phase=phase, data_handling=data_handling, n_channels=n_channels, n_samples=n_samples,

@@ -4,10 +4,10 @@
 	"resumption_count": null,
 	"previous_experiment": null,
 
-	"image_path": "/path_to_the_dataset/ChestX-ray8/images/images/",
+	"image_path": "/nas-ctm01/datasets/public/MEDICAL/MIMIC-CXR/",
 
 	"siamese_architecture": "ResNet-50",
-	"data_handling": "balanced",
+	"data_handling": "randomized",
 
 	"num_workers": 16,
 	"pin_memory": true,
@@ -23,7 +23,7 @@
 	"early_stopping": 5,
 	"transform": "image_net",
 
-	"n_samples_train": 792294,
-	"n_samples_val": 50000,
-	"n_samples_test": 100000
+	"n_samples_train": 147096,
+	"n_samples_val": 8672,
+	"n_samples_test": 17341
 }
