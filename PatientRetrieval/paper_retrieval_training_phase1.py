@@ -100,7 +100,8 @@ class complete_model(pl.LightningModule):
         self.loss_func = loss_func
 
         # used for val logging
-        self.test_set_val = eval_Dataset(root, validation_path_many, validation_path_singles)
+        val_df = get_data_df(root, "/nas-ctm01/homes/fpcampos/dev/diffusion/medfusion/data/mimic-cxr-2.0.0-split.csv", split="test")
+        self.test_set_val = eval_Dataset(root, val_df, val_df) 
 
         if self.hparams.frozen_at_start:
             extractor.freeze()
@@ -387,12 +388,14 @@ def build_mining_list_32(name_array, id_array, block_size):
 
 
 class miningDataset(data.Dataset):
-    def __init__(self, root, csv_file_path, train, bucket_size=8):
+    def __init__(self, root, patient_data_frame, train, bucket_size=8):
         self.root = root
         self.train = train
-        self.patient_data_frame = pd.read_csv(csv_file_path)
-        self.name_array = self.patient_data_frame['Image Index'].to_numpy()
-        self.id_array = self.patient_data_frame['Patient ID'].to_numpy()
+        self.patient_data_frame = patient_data_frame
+
+        
+        self.name_array = self.patient_data_frame['dicom_id'].to_numpy()
+        self.id_array = self.patient_data_frame['subject_id'].to_numpy()
         # create list that is ordered for our use case
         self.mining_list = build_mining_list_32(self.name_array, self.id_array, bucket_size)
         self.num_samples = len(self.mining_list)
@@ -412,8 +415,10 @@ class miningDataset(data.Dataset):
     def __getitem__(self, idx):
         # extract name and id
         name, patient_id = self.mining_list[idx]
+        row = self.patient_data_frame.loc[self.patient_data_frame["dicom_id"] == name]
+
         # open  and transform image
-        img = self.transform(Image.open(os.path.join(self.root, name)).convert('RGB'))
+        img = self.transform(Image.open(row['Path'].iloc[0]).convert('RGB'))
         return img, patient_id
 
     def __len__(self):
@@ -421,16 +426,17 @@ class miningDataset(data.Dataset):
 
 
 class eval_Dataset(data.Dataset):
-    def __init__(self, root, csv_many, csv_singles, size=None):
+    def __init__(self, root, patient_data_many, patient_data_singles, size=None):
         self.root = root
-        patient_data_many = pd.read_csv(csv_many)
-        name_array_many = patient_data_many['Image Index'].to_list()
-        id_array_many = patient_data_many['Patient ID'].to_list()
-        patient_data_singles = pd.read_csv(csv_singles)
-        name_array_singles = patient_data_singles['Image Index'].to_list()
-        id_array_singles = patient_data_singles['Patient ID'].to_list()
-        self.name_array = name_array_many + name_array_singles
-        self.id_array = id_array_many + id_array_singles
+        name_array_many = patient_data_many['dicom_id'].to_list()
+        id_array_many = patient_data_many['subject_id'].to_list()
+        # name_array_singles = patient_data_singles['dicom_id'].to_list()
+        # id_array_singles = patient_data_singles['subject_id'].to_list()
+        # self.name_array = name_array_many + name_array_singles
+        # self.id_array = id_array_many + id_array_singles
+        self.patient_data_frame = patient_data_many
+        self.name_array = name_array_many
+        self.id_array = id_array_many
         self.num_samples = len(self.name_array)
 
         if size is not None:
@@ -450,51 +456,73 @@ class eval_Dataset(data.Dataset):
         # extract name and id
         name = self.name_array[idx]
         patient_id = self.id_array[idx]
-        img = self.transform(Image.open(os.path.join(self.root, name)).convert('RGB'))
+        row = self.patient_data_frame.loc[self.patient_data_frame["dicom_id"] == name]
+
+        img = self.transform(Image.open(row['Path'].iloc[0]).convert('RGB'))
         return img, patient_id
 
     def __len__(self):
         return self.num_samples
 
+def get_data_df(root, split_path, split="train"):
+    metadata_labels = pd.read_csv(f"{root}/mimic-cxr-2.0.0-metadata.csv")
+    metadata_labels = metadata_labels.loc[metadata_labels['ViewPosition'] == 'PA']
+    splits = pd.read_csv(split_path)
+    labels = metadata_labels.merge(splits, on="dicom_id", suffixes=('', '_right'), how="left")
+    labels = labels[labels["split"] == split]
+
+    def get_path(row):
+        dicom_id = str(row['dicom_id'])
+        subject = 'p' + str(int(row['subject_id']))
+        study = 's' + str(int(row['study_id']))
+        image_file = dicom_id + '.jpg'
+        return root + '/files/' + subject[:3] + '/' + subject + '/' + study + '/' + image_file
+    
+    labels['Path'] = labels.apply(get_path, axis=1)
+
+    return labels
 
 # works as a wrapper for all things related to the datasets/loaders, again PyTorch Lightning based
 class MiningDataModule(pl.LightningDataModule):
     def __init__(self,
                  root_images,
-                 path_train,
-                 path_val,
-                 path_test,
+                 root,
                  batch_size=32,
                  num_workers=0,
                  single_csv_val=None,
-                 single_csv_test=None):
+                 single_csv_test=None,
+                 split_path=None):
         super().__init__()
 
         self.single_csv_val = single_csv_val
         self.single_csv_test = single_csv_test
         self.root_images = root_images
-        self.path_train = path_train
-        self.path_val = path_val
-        self.path_test = path_test
+        self.root = root
+        self.split_path = split_path
         self.batch_size = batch_size
-        self.num_workers = num_workers
+        self.num_workers = num_workers     
 
     def setup(self, stage):
         # split dataset
+        # if stage == 'fit':
+        #     self.train_set = miningDataset(self.root_images, get_data_df(self.root, self.split_path, split="train"), train=True)
+        #     self.val_set = eval_Dataset(self.root_images, get_data_df(self.root, self.split_path, split="validate"), self.single_csv_val)
+        # if stage == 'test':
+        #     self.test_set = eval_Dataset(self.root_images, get_data_df(self.root, self.split_path, split="test"), self.single_csv_test)
         if stage == 'fit':
-            self.train_set = miningDataset(self.root_images, self.path_train, train=True)
-            self.val_set = eval_Dataset(self.root_images, self.path_val, self.single_csv_val)
+            self.train_set = miningDataset(self.root_images, get_data_df(self.root, self.split_path, split="train"), train=True)
+            self.val_set = eval_Dataset(self.root_images, get_data_df(self.root, self.split_path, split="validate"), get_data_df(self.root, self.split_path, split="validate"))
         if stage == 'test':
-            self.test_set = eval_Dataset(self.root_images, self.path_test, self.single_csv_test)
+            self.test_set = eval_Dataset(self.root_images, get_data_df(self.root, self.split_path, split="test"), get_data_df(self.root, self.split_path, split="validate"))
 
     # return the dataloader for each split
     def train_dataloader(self):
-        self.train_set = miningDataset(self.root_images, self.path_train, train=True)
+        self.train_set = miningDataset(self.root_images, get_data_df(self.root, self.split_path, split="train"), train=True)
         train_loader = DataLoader(self.train_set, batch_size=self.batch_size, num_workers=self.num_workers)
         return train_loader
 
     def val_dataloader(self):
-        self.val_set = eval_Dataset(self.root_images, self.path_val, self.single_csv_val)
+        self.val_set = eval_Dataset(self.root_images, get_data_df(self.root, self.split_path, split="validate"), get_data_df(self.root, self.split_path, split="validate"))
         val_loader = DataLoader(self.val_set, batch_size=self.batch_size, num_workers=self.num_workers)
         return val_loader
 
@@ -610,13 +638,12 @@ def main():
 
     data_module = MiningDataModule(
         root_images=image_root,
-        path_train=csv_train,
-        path_val=csv_val,
-        path_test=csv_test,
+        root=config["image_root"],
+        split_path=config["mimic_split_path"],
         batch_size=model50.hparams.batch_size,
         num_workers=num_workers,
         single_csv_val=csv_val_singles,
-        single_csv_test=csv_test_singles
+        single_csv_test=csv_test_singles,
     )
 
     t1 = time.time()
