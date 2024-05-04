@@ -4,6 +4,7 @@ from fastai import layers
 from fastai.torch_core import *
 import pytorch_lightning as pl
 from pytorch_metric_learning.utils.accuracy_calculator import AccuracyCalculator
+from pytorch_metric_learning.utils import accuracy_calculator
 from pytorch_metric_learning import testers
 from pytorch_metric_learning import miners, losses, reducers, distances, regularizers
 import pandas as pd
@@ -72,6 +73,16 @@ class model_head(nn.Module):
         return self.second_fc(x)
 
 
+class MyAccuracyCalculator(accuracy_calculator.AccuracyCalculator):
+    def calculate_precision_at_2(self, knn_labels, query_labels, **kwargs):
+        return accuracy_calculator.precision_at_k(knn_labels, query_labels[:, None], 2, avg_of_avgs=False)
+
+    def calculate_precision_at_5(self, knn_labels, query_labels, **kwargs):
+        return accuracy_calculator.precision_at_k(knn_labels, query_labels[:, None], 5, avg_of_avgs=False)
+    
+    def calculate_precision_at_10(self, knn_labels, query_labels, **kwargs):
+        return accuracy_calculator.precision_at_k(knn_labels, query_labels[:, None], 10, avg_of_avgs=False)
+
 # wrapper for all network parts, takes in extractor, head and the loss function, here, PyTorch lightning was used as a
 # framework
 class complete_model(pl.LightningModule):
@@ -95,8 +106,7 @@ class complete_model(pl.LightningModule):
 
         # tool to compute our metrics of interest, as well as the distances within the dataset
         self.distance = distances.LpDistance(normalize_embeddings=False)
-        self.accuracy_calculator = AccuracyCalculator(include=("mean_average_precision_at_r", "precision_at_1",
-                                                               "r_precision"), avg_of_avgs=False)
+        self.accuracy_calculator = MyAccuracyCalculator(include=("mean_average_precision_at_r", "precision_at_1", "precision_at_2", "precision_at_5", "precision_at_10", "r_precision"), avg_of_avgs=False)
         self.loss_func = loss_func
 
         # used for val logging
@@ -143,10 +153,10 @@ class complete_model(pl.LightningModule):
         """
 
         scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=self.hparams.learning_rate,
-                                                        # num_samples/batchsize = 61755/32
+                                                        # num_samples/batchsize = 1627703/32
                                                         total_steps=(int(61755 / 32) + 1) * self.hparams.expected_num_epochs + 1,
                                                         epochs=None,
-                                                        # overall 61755 images / batchsize 32 = 2165 = number of steps in the scheduler
+                                                        # overall 5708 images / batchsize 32 = 2165 = number of steps in the scheduler
                                                         steps_per_epoch=None,
                                                         pct_start=0.3, anneal_strategy='cos',
                                                         cycle_momentum=True, base_momentum=0.85,
@@ -156,7 +166,7 @@ class complete_model(pl.LightningModule):
         scheduler = {"scheduler": scheduler,
                      "interval": "step",
                      "frequency": 1}
-        
+
         return [optimizer], [scheduler]
 
     # define diff process steps during training validation and testing, describing the data flow and logging
@@ -175,6 +185,17 @@ class complete_model(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         inputs, labels = batch
         embeddings = self(inputs)
+
+        # Sanity check save input images and labels to files
+        for i in range(len(inputs)):
+            img = inputs[i].permute(1, 2, 0).cpu().numpy()
+            img = (img - np.min(img)) / (np.max(img) - np.min(img))
+            img = (img * 255).astype(np.uint8)
+            img = Image.fromarray(img)
+            img.save(f"input_{i}.png")
+            print(f"Label {i}: {labels[i]}")
+        exit(2)
+
         loss = self.loss_func(embeddings, labels)
         metrics = {'val_loss': loss}
         self.log_dict(metrics)
@@ -217,12 +238,18 @@ class complete_model(pl.LightningModule):
         print("Test set accuracy (MAP@R) = {}".format(accuracies["mean_average_precision_at_r"]))
         print("r_prec = "+ str(accuracies["r_precision"]))
         print("prec_at_1 = "+ str(accuracies["precision_at_1"]))
+        print("prec_at_2 = "+ str(accuracies["precision_at_2"]))
+        print("prec_at_5 = "+ str(accuracies["precision_at_5"]))
+        print("prec_at_10 = "+ str(accuracies["precision_at_10"]))
         t1 = time.time()
         print("Time used for evaluating: " + str((t1 - t0) / 60) + " minutes")
 
         metrics = {"MAP@R_test": accuracies["mean_average_precision_at_r"],
                    "r_precision": accuracies["r_precision"],
                    "precision_at_1": accuracies["precision_at_1"],
+                   "precision_at_2": accuracies["precision_at_2"],
+                   "precision_at_5": accuracies["precision_at_5"],
+                   "precision_at_10": accuracies["precision_at_10"],
                    "mean__val_distance": mean_distance,
                    "max_val_distance": max_distance
                    }
@@ -387,26 +414,209 @@ def build_mining_list_32(name_array, id_array, block_size):
     return mining_list
 
 
+
+class CelebaDB:
+    def __init__(self, images_dir='Img', eval_dir='Eval', anno_dir="Anno"):
+
+        # Add variables to class variables
+        self.images_dir = images_dir
+        self.eval_dir = eval_dir
+        self.anno_dir = anno_dir
+
+        # Data splits
+        self.train_set, self.val_set, self.test_set = self.load_data_splits()
+
+        # Identities
+        self.identity_celeba_dict, self.inv_identity_celeba_dict, self.nr_identities = self.load_identity_celeba()
+
+        # Attributes
+        self.list_attr_celeba, self.list_attr_celeba_columns = self.load_list_attr_celeba()
+
+        # Bboxes
+        self.list_bbox_celeba, self.list_bbox_celeba_columns = self.load_list_bbox_celeba()
+
+        # List landmarks (align)
+        self.list_landmarks_align_celeba, self.list_landmarks_align_celeba_columns = self.load_list_landmarks_celeba(align=True)
+
+        # List landmarks
+        self.list_landmarks_celeba, self.list_landmarks_celeba_columns = self.load_list_landmarks_celeba(align=False)
+
+        return
+    
+
+    # Method: Load data splits
+    def load_data_splits(self):
+
+        # Read data partitions file
+        list_eval_partition = pd.read_csv(os.path.join(self.eval_dir, "list_eval_partition.txt"), delimiter=" ", header=None)
+        list_eval_partition = list_eval_partition.values
+
+        # Get train (column==0)
+        train = list_eval_partition[list_eval_partition[:,1]==0]
+        train = list(train[:, 0])
+        
+        
+        # Get validation (column==1)
+        validation = list_eval_partition[list_eval_partition[:,1]==1]
+        validation = list(validation[:, 0])
+        
+
+        # Get test (column==2)
+        test = list_eval_partition[list_eval_partition[:,1]==2]
+        # print(test.shape)
+        test = list(test[:, 0])
+        
+        return train, validation, test
+    
+
+    # Method: Load identities
+    def load_identity_celeba(self):
+
+        # Read identities file
+        identity_celeba = pd.read_csv(os.path.join(self.anno_dir, "identity_CelebA.txt"), delimiter=" ", header=None)
+        identity_celeba = identity_celeba.values
+
+        # Create a identity dictionary
+        identity_celeba_dict = dict()
+        for arr in identity_celeba:
+            identity_celeba_dict[arr[0]] = arr[1]
+
+        # Create inverse identity dictionary
+        inv_identity_celeba_dict = dict()
+        for arr in identity_celeba:
+            if arr[1] in inv_identity_celeba_dict.keys():
+                inv_identity_celeba_dict[arr[1]].append(arr[0])
+            else:
+                inv_identity_celeba_dict[arr[1]] = [arr[0]]
+
+        # Get number of identities
+        nr_identities = len(inv_identity_celeba_dict)
+
+        return identity_celeba_dict, inv_identity_celeba_dict, nr_identities
+
+
+    # Method: Load list of attributes
+    def load_list_attr_celeba(self):
+
+        # Read list of attributes file
+        list_attr_celeba_txt = os.path.join(self.anno_dir, "list_attr_celeba.txt")
+        list_attr_celeba_dict = dict()
+        with open(list_attr_celeba_txt, 'r') as f:
+            for idx, line in enumerate(f.readlines()):
+                # print(line)
+                if idx == 0:
+                    nr_entries = int(line)
+                    # print(nr_entries)
+                elif idx == 1:
+                    column_names = [c for c in line.strip().split(" ")]
+                    # print(column_names)
+                else:
+                    row = [c for c in line.strip().split(" ")]
+                    img_name = row[0]
+                    img_attributes = [int(c) for c in row[1::] if c in ('-1', '1')]
+                    # print(img_name, img_attributes)
+                    # print(len(column_names) == len(img_attributes))
+
+                    assert len(img_attributes) == len(column_names)
+                    
+                    if img_name not in list_attr_celeba_dict.keys():
+                        list_attr_celeba_dict[img_name] = img_attributes
+
+        # print(list_attr_celeba_dict)
+
+        assert nr_entries == len(list_attr_celeba_dict)
+
+        return list_attr_celeba_dict, column_names
+    
+
+    # Method: Load lisf of bbox
+    def load_list_bbox_celeba(self):
+
+        # Read list of bboxes
+        list_bbox_celeba_txt = os.path.join(self.anno_dir, "list_bbox_celeba.txt")
+        list_bbox_celeba_dict = dict()
+        with open(list_bbox_celeba_txt, 'r') as f:
+            for idx, line in enumerate(f.readlines()):
+                if idx == 0:
+                    nr_entries = int(line)
+                elif idx == 1:
+                    column_names = [c for c in line.strip().split(" ")]
+                else:
+                    row = [c for c in line.strip().split(" ") if c != '']
+                    img_name = row[0]
+                    img_bbox = [float(c) for c in row[1::]]
+                    
+                    assert len(row) == len(column_names)
+
+                    if img_name not in list_bbox_celeba_dict.keys():
+                        list_bbox_celeba_dict[img_name] = img_bbox
+
+        assert len(list_bbox_celeba_dict) == nr_entries
+
+        return list_bbox_celeba_dict, column_names
+    
+
+    # Method: Load list landmarks
+    def load_list_landmarks_celeba(self, align):
+
+        assert align in (True, False)
+
+
+        # Get landmarks filenames
+        list_landmarks_celeba_txt = os.path.join(self.anno_dir, "list_landmarks_celeba.txt")
+        list_landmarks_align_celeba_txt = os.path.join(self.anno_dir, "list_landmarks_align_celeba.txt")
+        
+        # Create a landmarks dictionary
+        list_landmarks_dict = dict()
+
+        # Get the proper landmarks file
+        landmarks_file = list_landmarks_align_celeba_txt if align else list_landmarks_celeba_txt
+        with open(landmarks_file, 'r') as f:
+            for idx, line in enumerate(f.readlines()):
+                if idx == 0:
+                    nr_entries = int(line)
+                elif idx == 1:
+                    column_names = [c for c in line.strip().split(" ")]
+                else:
+                    row = [c for c in line.strip().split(" ") if c != '']
+                    img_name = row[0]
+                    landmarks_coords = [float(c) for c in row[1::]]
+                    
+                    assert len(landmarks_coords) == len(column_names)
+
+                    if img_name not in list_landmarks_dict.keys():
+                        list_landmarks_dict[img_name] = landmarks_coords
+
+        assert len(list_landmarks_dict) == nr_entries
+
+        return list_landmarks_dict, column_names
+
 class miningDataset(data.Dataset):
     def __init__(self, root, patient_data_frame, train, bucket_size=8):
         self.root = root
         self.train = train
-        self.patient_data_frame = patient_data_frame
+        self.db = CelebaDB(
+            images_dir=self.root+'/Img',
+            eval_dir=self.root+'/Eval',
+            anno_dir=self.root+'/Anno'
+        )
+        self.set = self.db.train_set if train else self.db.val_set # TODO: Test set?
+        self.name_array = np.array(list(int(i.split(".")[0]) for i in self.set))
+        self.id_array = np.array([self.db.identity_celeba_dict[filename] for filename in self.set])
 
-        
-        self.name_array = self.patient_data_frame['dicom_id'].to_numpy()
-        self.id_array = self.patient_data_frame['subject_id'].to_numpy()
         # create list that is ordered for our use case
         self.mining_list = build_mining_list_32(self.name_array, self.id_array, bucket_size)
         self.num_samples = len(self.mining_list)
 
         if self.train:
             transform_list = [
-                tv.transforms.ColorJitter(brightness=0.4, saturation=0, contrast=0.4, hue=0),
+                tv.transforms.Resize([256, 256], interpolation=2), # TODO: Note just changed this for celeb!
+                # tv.transforms.ColorJitter(brightness=0.4, saturation=0, contrast=0.4, hue=0),
                 tv.transforms.ToTensor(),
                 tv.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])]
         else:
             transform_list = [
+                tv.transforms.Resize([256, 256], interpolation=2),
                 tv.transforms.ToTensor(),
                 tv.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])]
 
@@ -415,72 +625,63 @@ class miningDataset(data.Dataset):
     def __getitem__(self, idx):
         # extract name and id
         name, patient_id = self.mining_list[idx]
-        row = self.patient_data_frame.loc[self.patient_data_frame["dicom_id"] == name]
+        img_name = self.set[idx]
+        img_path = os.path.join(self.root, 'Img', "img_celeba", img_name)
+        img = Image.open(img_path).convert('RGB')
+        img = self.transform(img)
 
-        # open  and transform image
-        img = self.transform(Image.open(row['Path'].iloc[0]).convert('RGB'))
         return img, patient_id
 
     def __len__(self):
-        return self.num_samples
+        return 61755
+	#        return self.num_samples # TODO:
 
 
 class eval_Dataset(data.Dataset):
     def __init__(self, root, patient_data_many, patient_data_singles, size=None):
         self.root = root
-        name_array_many = patient_data_many['dicom_id'].to_list()
-        id_array_many = patient_data_many['subject_id'].to_list()
-        # name_array_singles = patient_data_singles['dicom_id'].to_list()
-        # id_array_singles = patient_data_singles['subject_id'].to_list()
-        # self.name_array = name_array_many + name_array_singles
-        # self.id_array = id_array_many + id_array_singles
-        self.patient_data_frame = patient_data_many
-        self.name_array = name_array_many
-        self.id_array = id_array_many
+        
+
+        self.root = root
+        self.db = CelebaDB(
+            images_dir=self.root + '/Img',
+            eval_dir=self.root + '/Eval',
+            anno_dir=self.root + '/Anno'
+        )
+        self.set = self.db.val_set # TODO: Test set?
+
+        self.name_array = np.array(list(int(i.split(".")[0]) for i in self.set))
+        self.id_array = np.array([self.db.identity_celeba_dict[filename] for filename in self.set])
         self.num_samples = len(self.name_array)
 
         if size is not None:
             transform_list = [
                 tv.transforms.Resize(size, interpolation=2),
-                tv.transforms.Resize([1024, 1024], interpolation=2),
+                tv.transforms.Resize([256, 256], interpolation=2),
                 tv.transforms.ToTensor(),
                 tv.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])]
         else:
             transform_list = [
+                tv.transforms.Resize([256, 256], interpolation=2),
                 tv.transforms.ToTensor(),
                 tv.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])]
 
         self.transform = tv.transforms.Compose(transform_list)
 
     def __getitem__(self, idx):
-        # extract name and id
-        name = self.name_array[idx]
-        patient_id = self.id_array[idx]
-        row = self.patient_data_frame.loc[self.patient_data_frame["dicom_id"] == name]
-
-        img = self.transform(Image.open(row['Path'].iloc[0]).convert('RGB'))
+        name, patient_id = self.name_array[idx], self.id_array[idx]
+        #print(len(self.name_array), len(self.id_array), len(self.set), idx)
+        img_name = self.set[idx]
+        img_path = os.path.join(self.root, 'Img', "img_celeba", img_name)
+        img = Image.open(img_path).convert('RGB')
+        img = self.transform(img)
         return img, patient_id
 
     def __len__(self):
         return self.num_samples
 
-def get_data_df(root, split_path, split="train"):
-    metadata_labels = pd.read_csv(f"{root}/mimic-cxr-2.0.0-metadata.csv")
-    metadata_labels = metadata_labels.loc[metadata_labels['ViewPosition'] == 'PA']
-    splits = pd.read_csv(split_path)
-    labels = metadata_labels.merge(splits, on="dicom_id", suffixes=('', '_right'), how="left")
-    labels = labels[labels["split"] == split]
-
-    def get_path(row):
-        dicom_id = str(row['dicom_id'])
-        subject = 'p' + str(int(row['subject_id'])) # todo: this is a lazy hack instead of properly changing column type
-        study = 's' + str(int(row['study_id']))
-        image_file = dicom_id + '.jpg'
-        return root + '/files/' + subject[:3] + '/' + subject + '/' + study + '/' + image_file
-    
-    labels['Path'] = labels.apply(get_path, axis=1)
-
-    return labels
+def get_data_df(root, split_path, split="train"): # TODO: Remove (useless)
+    return []
 
 # works as a wrapper for all things related to the datasets/loaders, again PyTorch Lightning based
 class MiningDataModule(pl.LightningDataModule):
@@ -503,12 +704,6 @@ class MiningDataModule(pl.LightningDataModule):
         self.num_workers = num_workers     
 
     def setup(self, stage):
-        # split dataset
-        # if stage == 'fit':
-        #     self.train_set = miningDataset(self.root_images, get_data_df(self.root, self.split_path, split="train"), train=True)
-        #     self.val_set = eval_Dataset(self.root_images, get_data_df(self.root, self.split_path, split="validate"), self.single_csv_val)
-        # if stage == 'test':
-        #     self.test_set = eval_Dataset(self.root_images, get_data_df(self.root, self.split_path, split="test"), self.single_csv_test)
         if stage == 'fit':
             self.train_set = miningDataset(self.root_images, get_data_df(self.root, self.split_path, split="train"), train=True)
             self.val_set = eval_Dataset(self.root_images, get_data_df(self.root, self.split_path, split="validate"), get_data_df(self.root, self.split_path, split="validate")) # TODO
@@ -519,6 +714,7 @@ class MiningDataModule(pl.LightningDataModule):
     def train_dataloader(self):
         self.train_set = miningDataset(self.root_images, get_data_df(self.root, self.split_path, split="train"), train=True)
         train_loader = DataLoader(self.train_set, batch_size=self.batch_size, num_workers=self.num_workers)
+
         return train_loader
 
     def val_dataloader(self):
@@ -638,13 +834,14 @@ def main():
 
     data_module = MiningDataModule(
         root_images=image_root,
-        root="/nas-ctm01/datasets/public/MEDICAL/MIMIC-CXR", # TODO: change this to arg
-        split_path="/nas-ctm01/homes/fpcampos/dev/diffusion/medfusion/data/mimic-cxr-2.0.0-split.csv",
+        root="/nas-ctm01/datasets/public/BIOMETRICS/celeba-db/", # TODO: change this to arg
+        split_path="/nas-ctm01/homes/fpcampos/dev/diffusion/medfusion/data/mimic-cxr-2.0.0-split.csv", # TODO: Useless for celeb
         batch_size=model50.hparams.batch_size,
         num_workers=num_workers,
         single_csv_val=csv_val_singles,
         single_csv_test=csv_test_singles,
     )
+    data_module.setup("test")
 
     t1 = time.time()
     trainer50.fit(model50, data_module)
@@ -655,8 +852,4 @@ def main():
 
 
 if __name__ == '__main__':
-    #root = "/nas-ctm01/datasets/public/MEDICAL/MIMIC-CXR"
-    #split_path =  "/nas-ctm01/homes/fpcampos/dev/diffusion/medfusion/data/mimic-cxr-2.0.0-split.csv"
-    #val_set = eval_Dataset(root, get_data_df(root, split_path, split="validate"), get_data_df(root, split_path, split="validate")) # TODO
-    #print(val_set[0])
     main()
